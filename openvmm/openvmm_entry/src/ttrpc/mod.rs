@@ -88,6 +88,8 @@ use pal_async::task::Task;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use std::fs::File;
 use std::future::Future;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storvsp_resources::ScsiControllerHandle;
@@ -370,6 +372,7 @@ impl Worker for TtrpcWorker {
                 controller_task: None,
                 wait_vm_response: None,
                 lifecycle: VmLifecycle::Uninitialized,
+                snapshot_saved: false,
                 rpc_tasks: Vec::new(),
                 transport: self.transport,
                 registry: FdRegistry::default(),
@@ -556,6 +559,48 @@ enum VmLifecycle {
     Halted(String),
 }
 
+struct RestoreParameters {
+    source_path: PathBuf,
+    resume: bool,
+}
+
+fn prepare_snapshot_restore(
+    snapshot_dir: &Path,
+    expected_memory_size: u64,
+    expected_vp_count: u32,
+) -> anyhow::Result<(
+    openvmm_defs::worker::SharedMemoryFd,
+    mesh::payload::message::ProtobufMessage,
+)> {
+    let (manifest, state_bytes) = openvmm_helpers::snapshot::read_snapshot(snapshot_dir)?;
+    openvmm_helpers::snapshot::validate_manifest(
+        &manifest,
+        crate::GUEST_ARCH,
+        expected_memory_size,
+        expected_vp_count,
+        crate::system_page_size(),
+    )?;
+
+    let memory_file = fs_err::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(snapshot_dir.join("memory.bin"))
+        .context("failed to open snapshot memory.bin")?;
+    let file_size = memory_file.metadata()?.len();
+    if file_size != manifest.memory_size_bytes {
+        bail!(
+            "memory.bin size ({file_size} bytes) doesn't match manifest ({} bytes)",
+            manifest.memory_size_bytes,
+        );
+    }
+
+    let shared_memory =
+        openvmm_helpers::shared_memory::file_to_shared_memory_fd(memory_file.into())?;
+    let saved_state = mesh::payload::decode(&state_bytes)
+        .context("failed to decode saved state from snapshot")?;
+    Ok((shared_memory, saved_state))
+}
+
 impl From<&VmLifecycle> for vmservice::VmState {
     fn from(lifecycle: &VmLifecycle) -> Self {
         match lifecycle {
@@ -575,6 +620,7 @@ struct VmService {
     controller_task: Option<Task<()>>,
     wait_vm_response: Option<(mesh::CancelContext, mesh::OneshotSender<Result<(), Status>>)>,
     lifecycle: VmLifecycle,
+    snapshot_saved: bool,
     rpc_tasks: Vec<Task<()>>,
     transport: ResolvedTransport,
     /// Registry of file descriptors passed in over the fd-passing protocol,
@@ -648,6 +694,12 @@ impl VmService {
             }
             vmservice::Vm::ResumeVm((), response) => {
                 response.send(map_grpc(self.resume_vm().await));
+            }
+            vmservice::Vm::SnapshotVm(request, response) => {
+                response.send(map_grpc(self.snapshot_vm(request).await));
+            }
+            vmservice::Vm::RestoreVm(request, response) => {
+                response.send(map_grpc(self.restore_vm(request).await));
             }
             vmservice::Vm::WaitVm((), response) => {
                 if self.vm.is_none() {
@@ -743,8 +795,42 @@ impl VmService {
     }
 
     async fn create_vm(&mut self, request: vmservice::CreateVmRequest) -> anyhow::Result<()> {
-        let mut req_config = request.config.context("missing configuration")?;
+        let req_config = request.config.context("missing configuration")?;
+        self.create_vm_inner(req_config, None).await
+    }
 
+    async fn restore_vm(&mut self, request: vmservice::RestoreVmRequest) -> anyhow::Result<()> {
+        let source_path = PathBuf::from(request.source_path);
+        if source_path.as_os_str().is_empty() {
+            bail!("missing snapshot source path");
+        }
+
+        let memory_restore_mode =
+            vmservice::MemoryRestoreMode::from_i32(request.memory_restore_mode)
+                .context("unknown memory restore mode")?;
+        if memory_restore_mode != vmservice::MemoryRestoreMode::SharedInPlace {
+            bail!(
+                "memory restore mode {:?} is not implemented",
+                memory_restore_mode
+            );
+        }
+
+        let config = request.config.context("missing configuration")?;
+        self.create_vm_inner(
+            config,
+            Some(RestoreParameters {
+                source_path,
+                resume: request.resume,
+            }),
+        )
+        .await
+    }
+
+    async fn create_vm_inner(
+        &mut self,
+        mut req_config: vmservice::VmConfig,
+        restore: Option<RestoreParameters>,
+    ) -> anyhow::Result<()> {
         if self.vm.is_some() {
             bail!("VM already created");
         }
@@ -903,6 +989,16 @@ impl VmService {
         // `NumaConfig` are mutually exclusive (mirrors the CLI `--memory` vs
         // `--numa` conflict). `config_mem_size` is the total guest memory
         // reported to the `VmController`.
+        let memory_backing_file = req_config
+            .memory_config
+            .as_ref()
+            .and_then(|config| config.backing_file_path.as_deref())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        if restore.is_some() && memory_backing_file.is_some() {
+            bail!("memory backing file cannot be specified when restoring a snapshot");
+        }
+
         let (numa, config_mem_size) = if let Some(numa_config) = req_config.numa_config.take() {
             if req_config.memory_config.is_some() {
                 bail!("memory_config and numa_config are mutually exclusive");
@@ -1120,14 +1216,34 @@ impl VmService {
             .await
             .context("spawning vm process failed")?;
 
-        let worker = vm_host
+        let (shared_memory, saved_state, active_memory_backing_file) = if let Some(restore) =
+            &restore
+        {
+            let (shared_memory, saved_state) =
+                prepare_snapshot_restore(&restore.source_path, config_mem_size, config_proc_count)?;
+            (
+                Some(shared_memory),
+                Some(saved_state),
+                Some(restore.source_path.join("memory.bin")),
+            )
+        } else {
+            let shared_memory = memory_backing_file
+                .as_ref()
+                .map(|path| {
+                    openvmm_helpers::shared_memory::open_memory_backing_file(path, config_mem_size)
+                })
+                .transpose()?;
+            (shared_memory, None, memory_backing_file)
+        };
+
+        let mut worker = vm_host
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
                     hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
                     cfg: config,
-                    saved_state: None,
-                    shared_memory: None,
+                    saved_state,
+                    shared_memory,
                     rpc: recv,
                     notify: notify_send,
                 },
@@ -1136,6 +1252,14 @@ impl VmService {
 
         let memory = config_mem_size;
         let processors = config_proc_count;
+        let restore_resume = restore.as_ref().is_some_and(|restore| restore.resume);
+        if restore_resume {
+            if let Err(err) = send.call(VmRpc::Resume, ()).await {
+                worker.stop();
+                let _ = worker.join().await;
+                return Err(err).context("failed to resume restored VM");
+            }
+        }
 
         // Create channels for VmController.
         let (vm_controller_send, vm_controller_recv) = mesh::channel();
@@ -1153,7 +1277,7 @@ impl VmService {
             vm_rpc: send.clone(),
             paravisor_diag: None,
             igvm_path: None,
-            memory_backing_file: None,
+            memory_backing_file: active_memory_backing_file,
             memory,
             processors,
             log_file: None,
@@ -1175,7 +1299,12 @@ impl VmService {
             consomme_rpc,
             worker_rpc: send,
         }));
-        self.lifecycle = VmLifecycle::Paused;
+        self.snapshot_saved = false;
+        if restore_resume {
+            self.lifecycle = VmLifecycle::Running;
+        } else {
+            self.lifecycle = VmLifecycle::Paused;
+        }
         Ok(())
     }
 
@@ -1194,6 +1323,7 @@ impl VmService {
         }
         self.vm_controller_events.take();
         self.lifecycle = VmLifecycle::Uninitialized;
+        self.snapshot_saved = false;
         if let Some((_, response)) = self.wait_vm_response.take() {
             response.send(Err(grpc_error(anyhow!("VM torn down"))));
         }
@@ -1257,6 +1387,9 @@ impl VmService {
     }
 
     async fn resume_vm(&mut self) -> anyhow::Result<()> {
+        if self.snapshot_saved {
+            bail!("cannot resume a VM after creating a LINK snapshot");
+        }
         let vm = self.vm.clone().context("VM not created yet")?;
         vm.worker_rpc
             .call(VmRpc::Resume, ())
@@ -1266,6 +1399,30 @@ impl VmService {
         if !matches!(self.lifecycle, VmLifecycle::Halted(_)) {
             self.lifecycle = VmLifecycle::Running;
         }
+        Ok(())
+    }
+
+    async fn snapshot_vm(&mut self, request: vmservice::SnapshotVmRequest) -> anyhow::Result<()> {
+        let memory_mode = vmservice::SnapshotMemoryMode::from_i32(request.memory_mode)
+            .context("unknown snapshot memory mode")?;
+        if memory_mode != vmservice::SnapshotMemoryMode::Link {
+            bail!("snapshot memory mode {:?} is not implemented", memory_mode);
+        }
+
+        if request.destination_path.is_empty() {
+            bail!("missing snapshot destination path");
+        }
+
+        let controller = self.vm_controller.as_ref().context("VM not created yet")?;
+        controller
+            .call(VmControllerRpc::SaveSnapshot, request.destination_path)
+            .await
+            .map_err(anyhow::Error::from)?
+            .map_err(anyhow::Error::from)
+            .context("snapshot failed")?;
+
+        self.lifecycle = VmLifecycle::Paused;
+        self.snapshot_saved = true;
         Ok(())
     }
 
@@ -1501,7 +1658,7 @@ impl VmService {
 fn open_socket_backend(
     connect: bool,
 ) -> (
-    fn(&std::path::Path) -> std::io::Result<Resource<SerialBackendHandle>>,
+    fn(&Path) -> std::io::Result<Resource<SerialBackendHandle>>,
     &'static str,
 ) {
     if connect {

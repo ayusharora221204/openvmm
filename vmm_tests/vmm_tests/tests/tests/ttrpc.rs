@@ -151,6 +151,8 @@ async fn test_ttrpc_interface(
     for i in 0..3 {
         let com1_path = tempdir.path().join(format!("com1-{i}.sock"));
         let console_path = tempdir.path().join(format!("console-{i}.sock"));
+        let snapshot_memory_path = tempdir.path().join(format!("snapshot-memory-{i}.bin"));
+        let snapshot_path = tempdir.path().join(format!("snapshot-{i}"));
         let virtiofs_root = tempdir.path().join(format!("virtiofs-{i}"));
         let hotplug_virtiofs_root = tempdir.path().join(format!("hotplug-virtiofs-{i}"));
         let second_hotplug_virtiofs_root =
@@ -206,7 +208,7 @@ async fn test_ttrpc_interface(
         // and a switch, plus an empty hotplug port used below for
         // AddPcieDevice/RemovePcieDevice. Other iterations use the simpler
         // flat-memory configuration so the flat path stays covered too.
-        let (memory_config, numa_config, processor_config, pcie) = if i == 0 {
+        let (mut memory_config, numa_config, processor_config, pcie) = if i == 0 {
             let switch = vmservice::PcieSwitch {
                 name: "sw0".to_string(),
                 downstream_ports: vec![
@@ -342,6 +344,10 @@ async fn test_ttrpc_interface(
                 None,
             )
         };
+        if i == 1 {
+            memory_config.as_mut().unwrap().backing_file_path =
+                Some(snapshot_memory_path.to_string_lossy().into_owned());
+        }
 
         let (boot_initrd_path, kernel_cmdline) = if i == 0 {
             (
@@ -381,75 +387,85 @@ async fn test_ttrpc_interface(
             }),
         });
 
+        let vm_config = vmservice::VmConfig {
+            memory_config,
+            numa_config,
+            processor_config,
+            pcie,
+            boot_config: Some(vmservice::vm_config::BootConfig::DirectBoot(
+                vmservice::DirectBoot {
+                    kernel_path: kernel_path.get().to_string_lossy().to_string(),
+                    initrd_path: boot_initrd_path.to_string_lossy().to_string(),
+                    kernel_cmdline,
+                },
+            )),
+            serial_config: Some(vmservice::SerialConfig {
+                ports: vec![vmservice::serial_config::Config {
+                    port: 0,
+                    socket_path: com1_path.to_string_lossy().into(),
+                    connect: use_connect,
+                }],
+            }),
+            devices_config: Some(vmservice::DevicesConfig {
+                nic_config: vec![vmservice::NicConfig {
+                    nic_id: consomme_nic_id.clone(),
+                    mac_address: "00-15-5D-12-12-12".to_string(),
+                    backend: Some(vmservice::nic_config::Backend::Consomme(
+                        vmservice::ConsommeBackend {
+                            cidr: String::new(),
+                            ports: vec![vmservice::PortConfig {
+                                host_port: host_port.into(),
+                                guest_port: 80,
+                                protocol: vmservice::IpProtocol::Tcp as i32,
+                                host_address: host_address.to_string(),
+                            }],
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                virtio_console: (i != 1).then(|| vmservice::VirtioConsoleConfig {
+                    socket_path: console_path.to_string_lossy().into(),
+                    connect: use_connect,
+                }),
+                virtiofs_config: if i == 1 {
+                    vec![]
+                } else {
+                    vec![vmservice::VirtioFs {
+                        tag: "testfs".to_string(),
+                        root_path: virtiofs_root.to_string_lossy().into(),
+                        read_only: i == 0,
+                    }]
+                },
+                // A SCSI controller keeps a request channel
+                // alive for the lifetime of the VM, which used
+                // to stop the VM worker from ever finishing its
+                // stop. Attach a disk so that the teardown and
+                // quit paths below cover that.
+                scsi_disks: vec![vmservice::ScsiDisk {
+                    controller: 0,
+                    lun: 0,
+                    host_path: scsi_disk_path.to_string_lossy().into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            hvsocket_config: (i == 0).then(|| vmservice::HvSocketConfig {
+                path: hvsocket_path.to_string_lossy().to_string(),
+            }),
+            smbios_config,
+            ..Default::default()
+        };
+        let restore_config = (i == 1).then(|| {
+            let mut config = vm_config.clone();
+            config.memory_config.as_mut().unwrap().backing_file_path = None;
+            config
+        });
         client
             .call()
             .start(
                 vmservice::Vm::CreateVm,
                 vmservice::CreateVmRequest {
-                    config: Some(vmservice::VmConfig {
-                        memory_config,
-                        numa_config,
-                        processor_config,
-                        pcie,
-                        boot_config: Some(vmservice::vm_config::BootConfig::DirectBoot(
-                            vmservice::DirectBoot {
-                                kernel_path: kernel_path.get().to_string_lossy().to_string(),
-                                initrd_path: boot_initrd_path.to_string_lossy().to_string(),
-                                kernel_cmdline,
-                            },
-                        )),
-                        serial_config: Some(vmservice::SerialConfig {
-                            ports: vec![vmservice::serial_config::Config {
-                                port: 0,
-                                socket_path: com1_path.to_string_lossy().into(),
-                                connect: use_connect,
-                            }],
-                        }),
-                        devices_config: Some(vmservice::DevicesConfig {
-                            nic_config: vec![vmservice::NicConfig {
-                                nic_id: consomme_nic_id.clone(),
-                                mac_address: "00-15-5D-12-12-12".to_string(),
-                                backend: Some(vmservice::nic_config::Backend::Consomme(
-                                    vmservice::ConsommeBackend {
-                                        cidr: String::new(),
-                                        ports: vec![vmservice::PortConfig {
-                                            host_port: host_port.into(),
-                                            guest_port: 80,
-                                            protocol: vmservice::IpProtocol::Tcp as i32,
-                                            host_address: host_address.to_string(),
-                                        }],
-                                    },
-                                )),
-                                ..Default::default()
-                            }],
-                            virtio_console: Some(vmservice::VirtioConsoleConfig {
-                                socket_path: console_path.to_string_lossy().into(),
-                                connect: use_connect,
-                            }),
-                            virtiofs_config: vec![vmservice::VirtioFs {
-                                tag: "testfs".to_string(),
-                                root_path: virtiofs_root.to_string_lossy().into(),
-                                read_only: i == 0,
-                            }],
-                            // A SCSI controller keeps a request channel
-                            // alive for the lifetime of the VM, which used
-                            // to stop the VM worker from ever finishing its
-                            // stop. Attach a disk so that the teardown and
-                            // quit paths below cover that.
-                            scsi_disks: vec![vmservice::ScsiDisk {
-                                controller: 0,
-                                lun: 0,
-                                host_path: scsi_disk_path.to_string_lossy().into(),
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }),
-                        hvsocket_config: (i == 0).then(|| vmservice::HvSocketConfig {
-                            path: hvsocket_path.to_string_lossy().to_string(),
-                        }),
-                        smbios_config,
-                        ..Default::default()
-                    }),
+                    config: Some(vm_config),
                     log_id: String::new(),
                 },
             )
@@ -779,16 +795,44 @@ async fn test_ttrpc_interface(
 
                 client
                     .call()
-                    .start(vmservice::Vm::PauseVm, ())
+                    .start(
+                        vmservice::Vm::SnapshotVm,
+                        vmservice::SnapshotVmRequest {
+                            destination_path: snapshot_path.to_string_lossy().into_owned(),
+                            memory_mode: vmservice::SnapshotMemoryMode::Materialize as i32,
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::SnapshotVm,
+                        vmservice::SnapshotVmRequest {
+                            destination_path: snapshot_path.to_string_lossy().into_owned(),
+                            memory_mode: vmservice::SnapshotMemoryMode::Link as i32,
+                        },
+                    )
                     .await
                     .unwrap();
-
+                for name in ["manifest.bin", "state.bin", "memory.bin"] {
+                    assert!(
+                        snapshot_path.join(name).exists(),
+                        "SnapshotVm should create {name}"
+                    );
+                }
                 let props = query_props().await.unwrap();
                 assert_eq!(
                     props.state,
                     vmservice::VmState::Paused as i32,
-                    "after PauseVm, expected PAUSED"
+                    "SnapshotVm should leave the VM paused"
                 );
+                client
+                    .call()
+                    .start(vmservice::Vm::ResumeVm, ())
+                    .await
+                    .unwrap_err();
 
                 client
                     .call()
@@ -797,6 +841,46 @@ async fn test_ttrpc_interface(
                     .unwrap();
 
                 waiter.await.unwrap_err();
+
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_path: snapshot_path.to_string_lossy().into_owned(),
+                            memory_restore_mode: vmservice::MemoryRestoreMode::Copy as i32,
+                            config: restore_config.clone(),
+                            resume: false,
+                            log_id: String::new(),
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_path: snapshot_path.to_string_lossy().into_owned(),
+                            memory_restore_mode: vmservice::MemoryRestoreMode::SharedInPlace as i32,
+                            config: restore_config,
+                            resume: false,
+                            log_id: String::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let props = query_props().await.unwrap();
+                assert_eq!(
+                    props.state,
+                    vmservice::VmState::Paused as i32,
+                    "RestoreVm should leave the VM paused when resume is false"
+                );
+                client
+                    .call()
+                    .start(vmservice::Vm::TeardownVm, ())
+                    .await
+                    .unwrap();
             }
             _ => unreachable!(),
         }
