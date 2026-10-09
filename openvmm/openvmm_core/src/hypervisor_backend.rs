@@ -17,6 +17,7 @@ use crate::worker::dispatch::Manifest;
 use futures::future::BoxFuture;
 use hypervisor_resources::HypervisorKind;
 use membacking::SharedMemoryBacking;
+use openvmm_defs::worker::SharedMemoryFd;
 use vm_resource::CanResolveTo;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -50,6 +51,7 @@ pub(crate) type CreateVmFn = Box<
             VmTaskDriverSource,
             Manifest,
             Option<SharedMemoryBacking>,
+            Option<SharedMemoryFd>,
         ) -> BoxFuture<'static, anyhow::Result<InitializedVm>>
         + Send,
 >;
@@ -69,20 +71,23 @@ impl ResolvedHypervisorBackend {
         H: HypervisorBackend,
         for<'a> H::ProtoPartition<'a>: Send,
     {
-        Self(Box::new(move |driver_source, cfg, shared_memory| {
-            Box::pin(async move {
-                let mut hv = hypervisor;
-                let platform_info = virt::Hypervisor::platform_info(&hv);
-                InitializedVm::new_with_hypervisor(
-                    driver_source,
-                    &mut hv,
-                    platform_info,
-                    cfg,
-                    shared_memory,
-                )
-                .await
-            })
-        }))
+        Self(Box::new(
+            move |driver_source, cfg, shared_memory, snapshot_memory_copy_source| {
+                Box::pin(async move {
+                    let mut hv = hypervisor;
+                    let platform_info = virt::Hypervisor::platform_info(&hv);
+                    InitializedVm::new_with_hypervisor(
+                        driver_source,
+                        &mut hv,
+                        platform_info,
+                        cfg,
+                        shared_memory,
+                        snapshot_memory_copy_source,
+                    )
+                    .await
+                })
+            },
+        ))
     }
 }
 

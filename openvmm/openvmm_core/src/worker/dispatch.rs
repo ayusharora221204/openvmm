@@ -85,6 +85,7 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::SharedMemoryFd;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
@@ -105,6 +106,7 @@ use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -355,6 +357,7 @@ impl Worker for VmWorker {
             hypervisor.0,
             manifest,
             shared_memory,
+            parameters.snapshot_memory_copy_source,
         ))?;
         let saved_state = parameters
             .saved_state
@@ -393,6 +396,7 @@ impl Worker for VmWorker {
             hypervisor.0,
             manifest,
             shared_memory,
+            None,
         ))?;
         pal_async::local::block_on(async {
             let mut vm = vm.load(Some(saved_state), notify).await?;
@@ -781,6 +785,8 @@ fn resolve_proto_partition_isolation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pal_async::async_test;
+    use std::io::Cursor;
     use test_with_tracing::test;
 
     fn linux_load_mode(isolation: openvmm_defs::config::LinuxIsolationConfig) -> LoadMode {
@@ -840,6 +846,61 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[async_test]
+    async fn eager_copy_populates_discontiguous_guest_ranges() {
+        const PAGE: u64 = 4096;
+        let ranges = [
+            MemoryRange::new(0..PAGE),
+            MemoryRange::new(2 * PAGE..3 * PAGE),
+        ];
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(membacking::RamBackingRequest::new(ranges.to_vec()))
+            .build(3 * PAGE)
+            .await
+            .unwrap();
+        let guest_memory = manager.client().guest_memory().await.unwrap();
+
+        let mut source_bytes = vec![0xaa; PAGE as usize];
+        source_bytes.extend(vec![0xbb; PAGE as usize]);
+        populate_eager_memory_from_reader(
+            &mut Cursor::new(source_bytes),
+            2 * PAGE,
+            &guest_memory,
+            &ranges,
+        )
+        .unwrap();
+
+        let mut page = vec![0; PAGE as usize];
+        guest_memory.read_at(0, &mut page).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0xaa));
+        guest_memory.read_at(2 * PAGE, &mut page).unwrap();
+        assert!(page.iter().all(|&byte| byte == 0xbb));
+    }
+
+    #[async_test]
+    async fn eager_copy_rejects_short_source() {
+        const PAGE: u64 = 4096;
+        let ranges = [MemoryRange::new(0..PAGE)];
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(membacking::RamBackingRequest::new(ranges.to_vec()))
+            .build(PAGE)
+            .await
+            .unwrap();
+        let guest_memory = manager.client().guest_memory().await.unwrap();
+
+        let err = populate_eager_memory_from_reader(
+            &mut Cursor::new(vec![0xaa; (PAGE / 2) as usize]),
+            PAGE,
+            &guest_memory,
+            &ranges,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("snapshot memory source ended while reading range")
+        );
     }
 
     #[cfg(guest_arch = "aarch64")]
@@ -1095,6 +1156,65 @@ struct GenericInitiatorSource {
     vnode: u32,
 }
 
+fn populate_eager_memory(
+    source: SharedMemoryFd,
+    guest_memory: &GuestMemory,
+    ranges: &[MemoryRange],
+) -> anyhow::Result<()> {
+    let mut source = File::from(source);
+    let source_len = source
+        .metadata()
+        .context("failed to inspect snapshot memory source")?
+        .len();
+    populate_eager_memory_from_reader(&mut source, source_len, guest_memory, ranges)
+}
+
+fn populate_eager_memory_from_reader(
+    source: &mut impl Read,
+    source_len: u64,
+    guest_memory: &GuestMemory,
+    ranges: &[MemoryRange],
+) -> anyhow::Result<()> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+
+    let expected_len = ranges.iter().try_fold(0u64, |total, range| {
+        total
+            .checked_add(range.len())
+            .context("snapshot memory range size overflow")
+    })?;
+    if source_len != expected_len {
+        anyhow::bail!(
+            "snapshot memory source has size {source_len} bytes, expected {expected_len} bytes"
+        );
+    }
+
+    let mut buffer = vec![0; BUFFER_SIZE];
+    for &range in ranges {
+        let mut copied = 0u64;
+        while copied < range.len() {
+            let chunk_len = (range.len() - copied).min(BUFFER_SIZE as u64) as usize;
+            source
+                .read_exact(&mut buffer[..chunk_len])
+                .with_context(|| {
+                    format!(
+                        "snapshot memory source ended while reading range {} at offset {copied}",
+                        range
+                    )
+                })?;
+            let gpa = range
+                .start()
+                .checked_add(copied)
+                .context("guest memory address overflow")?;
+            guest_memory
+                .write_at(gpa, &buffer[..chunk_len])
+                .with_context(|| format!("failed to populate guest memory at GPA {gpa:#x}"))?;
+            copied += chunk_len as u64;
+        }
+    }
+
+    Ok(())
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -1102,8 +1222,15 @@ impl InitializedVm {
         create_vm: crate::hypervisor_backend::CreateVmFn,
         cfg: Manifest,
         shared_memory: Option<SharedMemoryBacking>,
+        snapshot_memory_copy_source: Option<SharedMemoryFd>,
     ) -> anyhow::Result<Self> {
-        create_vm(driver_source, cfg, shared_memory).await
+        create_vm(
+            driver_source,
+            cfg,
+            shared_memory,
+            snapshot_memory_copy_source,
+        )
+        .await
     }
 
     /// Creates and initializes a VM with the given hypervisor backend.
@@ -1118,6 +1245,7 @@ impl InitializedVm {
         platform_info: virt::PlatformInfo,
         cfg: Manifest,
         shared_memory: Option<SharedMemoryBacking>,
+        snapshot_memory_copy_source: Option<SharedMemoryFd>,
     ) -> anyhow::Result<Self>
     where
         H: virt::Hypervisor<Partition = P>,
@@ -1425,6 +1553,14 @@ impl InitializedVm {
         // For restore, an existing mappable can only be applied to
         // single-node configurations.
         let nodes_with_ranges = ranges_by_node.iter().filter(|r| !r.is_empty()).count();
+        if snapshot_memory_copy_source.is_some() && nodes_with_ranges != 1 {
+            anyhow::bail!(
+                "eager-copy restore requires exactly one memory object, found {nodes_with_ranges}"
+            );
+        }
+        let eager_memory_ranges = snapshot_memory_copy_source
+            .as_ref()
+            .map(|_| ranges_by_node.iter().flatten().copied().collect::<Vec<_>>());
         let mut existing_mappable = if let Some(smb) = shared_memory {
             if nodes_with_ranges > 1 {
                 anyhow::bail!(
@@ -1509,6 +1645,14 @@ impl InitializedVm {
             .guest_memory()
             .await
             .context("failed to get guest memory")?;
+        if let Some(source) = snapshot_memory_copy_source {
+            populate_eager_memory(
+                source,
+                &gm,
+                eager_memory_ranges.as_deref().unwrap_or_default(),
+            )
+            .context("failed to populate eager-copy guest memory")?;
+        }
         let mut cpuid = Vec::new();
 
         // Add in Hyper-V VMM CPUID leaves.

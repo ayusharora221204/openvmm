@@ -57,12 +57,25 @@ complete.
 
 `RestoreVM` creates a VM from a snapshot directory and a compatible
 `VMConfig`. Device configuration is not stored in the snapshot and must be
-supplied by the caller. `memory.bin` is used directly as mutable guest memory,
-so `MemoryConfig.backing_file_path` must not be set, and a snapshot can be
-restored only once. If `expected_snapshot_id` is provided, the restore fails
-unless it matches the snapshot ID in `manifest.bin`. The restored snapshot's
-ID is returned in `RestoreVmResult.snapshot_id`. Set `resume` to start the
-restored VM immediately; otherwise it is created paused.
+supplied by the caller. `MemoryConfig.source` selects how the snapshot memory
+is populated:
+
+* If `source` is absent, or explicitly selects `SHARED_IN_PLACE`,
+  `memory.bin` is used directly as mutable guest memory.
+  `MemoryConfig.backing_file_path` must be absent, and the snapshot is no
+  longer reusable after the restored VM runs.
+* `EAGER_COPY` allocates independent guest RAM and copies `memory.bin` into it
+  before processor and device state is restored. If
+  `MemoryConfig.backing_file_path` is supplied, that file is created or reused
+  as the clone's writable backing; otherwise OpenVMM allocates a fresh shared
+  memory object. The source snapshot remains reusable by other clones.
+
+The initial eager-copy implementation supports direct Linux guest boot and one
+memory object on KVM and WHP. NUMA memory sources, `PRIVATE_COPY_ON_WRITE`, and
+`ON_DEMAND` are not yet supported. If `expected_snapshot_id` is provided, the
+restore fails unless it matches the snapshot ID in `manifest.bin`. The
+restored snapshot's ID is returned in `RestoreVmResult.snapshot_id`. Set
+`resume` to start the restored VM immediately; otherwise it is created paused.
 
 `AddVpciDevice` dynamically exposes a PCI device to VTL0 over Hyper-V VPCI.
 The VM must have Hyper-V enlightenments and VMBus enabled, and the host

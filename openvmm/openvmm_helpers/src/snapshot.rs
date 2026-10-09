@@ -48,7 +48,7 @@ pub struct SnapshotManifest {
 /// Returns whether `a` and `b` refer to the same underlying file (as opposed
 /// to merely having the same path). Hard links to the same file are reported
 /// as the same file.
-fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

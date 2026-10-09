@@ -339,6 +339,8 @@ async fn test_ttrpc_interface(
         let console_path = tempdir.path().join(format!("console-{i}.sock"));
         let snapshot_memory_path = tempdir.path().join(format!("snapshot-memory-{i}.bin"));
         let snapshot_path = tempdir.path().join(format!("snapshot-{i}"));
+        let eager_memory_path = tempdir.path().join(format!("eager-memory-{i}.bin"));
+        let second_eager_memory_path = tempdir.path().join(format!("second-eager-memory-{i}.bin"));
         let virtiofs_root = tempdir.path().join(format!("virtiofs-{i}"));
         let hotplug_virtiofs_root = tempdir.path().join(format!("hotplug-virtiofs-{i}"));
         let second_hotplug_virtiofs_root =
@@ -1123,13 +1125,43 @@ async fn test_ttrpc_interface(
                     "RestoreVm with the wrong snapshot ID: {}",
                     err.message
                 );
+
+                let mut unspecified_config = restore_config.clone().unwrap();
+                unspecified_config.memory_config.as_mut().unwrap().source =
+                    Some(vmservice::MemorySource {
+                        kind: Some(vmservice::memory_source::Kind::Snapshot(
+                            vmservice::SnapshotMemorySource {
+                                population: vmservice::SnapshotMemoryPopulation::Unspecified as i32,
+                            },
+                        )),
+                    });
+                let err = client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_dir: snapshot_path.to_string_lossy().into_owned(),
+                            config: Some(unspecified_config),
+                            expected_snapshot_id: Some(snapshot_id.clone()),
+                            resume: false,
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    mesh_rpc::service::Code::InvalidArgument as i32,
+                    "RestoreVm with unspecified memory population: {}",
+                    err.message
+                );
+
                 let restore_result = client
                     .call()
                     .start(
                         vmservice::Vm::RestoreVm,
                         vmservice::RestoreVmRequest {
                             source_dir: snapshot_path.to_string_lossy().into_owned(),
-                            config: restore_config,
+                            config: restore_config.clone(),
                             // The expected ID is compared as a GUID, so case
                             // doesn't matter.
                             expected_snapshot_id: Some(snapshot_id.to_uppercase()),
@@ -1147,6 +1179,76 @@ async fn test_ttrpc_interface(
                     props.state,
                     vmservice::VmState::Paused as i32,
                     "RestoreVm should leave the VM paused when resume is false"
+                );
+                client
+                    .call()
+                    .start(vmservice::Vm::TeardownVm, ())
+                    .await
+                    .unwrap();
+
+                let eager_config = |memory_path: &Path| {
+                    let mut config = restore_config.clone().unwrap();
+                    let memory = config.memory_config.as_mut().unwrap();
+                    memory.backing_file_path = Some(memory_path.to_string_lossy().into_owned());
+                    memory.source = Some(vmservice::MemorySource {
+                        kind: Some(vmservice::memory_source::Kind::Snapshot(
+                            vmservice::SnapshotMemorySource {
+                                population: vmservice::SnapshotMemoryPopulation::EagerCopy as i32,
+                            },
+                        )),
+                    });
+                    config
+                };
+
+                let restore_result = client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_dir: snapshot_path.to_string_lossy().into_owned(),
+                            config: Some(eager_config(&eager_memory_path)),
+                            expected_snapshot_id: Some(snapshot_id.clone()),
+                            resume: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(restore_result.snapshot_id, snapshot_id);
+                assert_eq!(
+                    std::fs::metadata(&eager_memory_path).unwrap().len(),
+                    std::fs::metadata(snapshot_path.join("memory.bin"))
+                        .unwrap()
+                        .len()
+                );
+                let props = query_props().await.unwrap();
+                assert_eq!(
+                    props.state,
+                    vmservice::VmState::Running as i32,
+                    "eager-copy RestoreVm with resume should be RUNNING"
+                );
+                client
+                    .call()
+                    .start(vmservice::Vm::TeardownVm, ())
+                    .await
+                    .unwrap();
+
+                let restore_result = client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_dir: snapshot_path.to_string_lossy().into_owned(),
+                            config: Some(eager_config(&second_eager_memory_path)),
+                            expected_snapshot_id: Some(snapshot_id.clone()),
+                            resume: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(restore_result.snapshot_id, snapshot_id);
+                assert!(
+                    second_eager_memory_path.exists(),
+                    "the same snapshot should support a second eager-copy restore"
                 );
                 client
                     .call()

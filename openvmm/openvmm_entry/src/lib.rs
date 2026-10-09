@@ -2963,6 +2963,7 @@ async fn run_control_inner(
             cfg: vm_config,
             saved_state,
             shared_memory,
+            snapshot_memory_copy_source: None,
             rpc: rpc_recv,
             notify: notify_send,
         };

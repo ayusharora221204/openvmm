@@ -33,6 +33,9 @@ pub struct VmWorkerParameters {
     /// File-backed guest RAM handle. When set, guest memory uses this
     /// fd/handle instead of allocating anonymous memory.
     pub shared_memory: Option<SharedMemoryFd>,
+    /// Read-only snapshot memory handle copied into active guest RAM before VM
+    /// construction.
+    pub snapshot_memory_copy_source: Option<SharedMemoryFd>,
     /// The VM RPC channel.
     pub rpc: mesh::Receiver<VmRpc>,
     /// The notification channel.

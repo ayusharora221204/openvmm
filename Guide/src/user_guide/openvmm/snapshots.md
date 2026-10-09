@@ -89,6 +89,14 @@ restoring it again would combine modified memory with the original device
 state.
 ```
 
+The programmatic `RestoreVM` API also supports eager-copy restore. In that
+mode OpenVMM allocates independent RAM for the restored VM and copies
+`memory.bin` into it before applying processor and device state. Multiple
+OpenVMM processes can therefore restore isolated clones from the same
+snapshot. This option is currently exposed through
+`VMConfig.memory_config.source`; the `--restore-snapshot` CLI continues to use
+the shared-in-place behavior described above.
+
 ```admonish note
 The `--memory` and `--processors` values must match the values recorded in
 the snapshot manifest. If they do not match, OpenVMM will report a
@@ -191,9 +199,9 @@ immediately with a clear error if any active device does not support it.
 - Snapshots are **not portable** across architectures (e.g., you cannot
   restore an x86_64 snapshot on aarch64)
 - After restoring, `memory.bin` in the snapshot directory becomes the live
-  guest RAM backing file and will be modified as the VM runs. To restore
-  from the same snapshot multiple times, copy the snapshot directory before
-  each restore.
+  guest RAM backing file and will be modified as the VM runs when using the
+  CLI or the programmatic shared-in-place mode. Programmatic eager-copy
+  restore keeps the snapshot reusable.
 - VMs using VPCI or PCIe devices do not currently support save/restore
 - OpenHCL-based VMs do not currently support this snapshot mechanism
 - VMs using PCAT firmware do not support save/restore

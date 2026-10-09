@@ -34,6 +34,7 @@ impl Worker {
             cfg,
             saved_state: None,
             shared_memory,
+            snapshot_memory_copy_source: None,
             rpc: rpc_recv,
             notify: notify_send,
         };
