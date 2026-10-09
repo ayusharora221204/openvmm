@@ -187,8 +187,6 @@ enum SnapshotMemoryPopulation {
     SNAPSHOT_MEMORY_POPULATION_UNSPECIFIED = 0;
     EAGER_COPY = 1;
     SHARED_IN_PLACE = 2;
-    PRIVATE_COPY_ON_WRITE = 3;
-    ON_DEMAND = 4;
 }
 
 message ProcessorConfig {

@@ -851,16 +851,6 @@ fn parse_restore_memory_population(
                 "snapshot memory population must be specified",
             ))
         }
-        value if value == vmservice::SnapshotMemoryPopulation::PrivateCopyOnWrite as i32 => {
-            Err(code_error(
-                Code::InvalidArgument,
-                "private copy-on-write snapshot memory is not supported",
-            ))
-        }
-        value if value == vmservice::SnapshotMemoryPopulation::OnDemand as i32 => Err(code_error(
-            Code::InvalidArgument,
-            "on-demand snapshot memory is not supported",
-        )),
         _ => Err(code_error(
             Code::InvalidArgument,
             format!("invalid snapshot memory population {}", snapshot.population),
