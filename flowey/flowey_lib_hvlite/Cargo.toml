@@ -32,12 +32,10 @@ which.workspace = true
 
 [dev-dependencies]
 test_with_tracing.workspace = true
+toml_edit = { workspace = true, features = ["serde"] }
 
 [target.'cfg(windows)'.dependencies]
 crossterm = { workspace = true, features = ["windows"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-rpm = { workspace = true, features = ["payload", "zstd-compression"] }
 
 [lints]
 workspace = true
