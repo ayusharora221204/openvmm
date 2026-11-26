@@ -104,6 +104,7 @@ use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::GuestRamCopyMode;
 use openvmm_defs::worker::GuestRamSource;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -768,6 +769,7 @@ struct RestoreParameters {
 enum RestoreMemoryPopulation {
     SharedInPlace,
     EagerCopy,
+    OnDemand,
 }
 
 struct PreparedRestore {
@@ -831,10 +833,20 @@ fn prepare_snapshot_restore(
                 GuestRamSource::CopyFrom {
                     source: memory_file.into(),
                     destination,
+                    mode: GuestRamCopyMode::Eager,
                 },
                 destination_backing_file.map(Path::to_owned),
             )
         }
+        // The destination is fresh memory, so there is no named backing.
+        RestoreMemoryPopulation::OnDemand => (
+            GuestRamSource::CopyFrom {
+                source: memory_file.into(),
+                destination: None,
+                mode: GuestRamCopyMode::OnDemand,
+            },
+            None,
+        ),
     };
     let saved_state =
         mesh::payload::decode(state_bytes).context("failed to decode saved state from snapshot")?;
@@ -871,6 +883,31 @@ fn open_eager_copy_destination(
     openvmm_helpers::shared_memory::file_to_shared_memory_fd(destination)
 }
 
+/// Checks that on-demand restore is supported with the hypervisor identified
+/// by `hypervisor_id`.
+fn check_on_demand_restore_support(hypervisor_id: &str) -> anyhow::Result<()> {
+    cfg_select! {
+        target_os = "linux" => {
+            use vm_resource::ResourceId;
+            let kvm = <hypervisor_resources::KvmHandle as ResourceId<_>>::ID;
+            if hypervisor_id != kvm {
+                return Err(anyhow!(Code::FailedPrecondition).context(format!(
+                    "on-demand restore requires the {kvm} hypervisor, not {hypervisor_id}"
+                )));
+            }
+            membacking::check_on_demand_support().map_err(|err| {
+                anyhow!(Code::FailedPrecondition)
+                    .context(format!("on-demand restore is not supported on this host: {err}"))
+            })
+        }
+        _ => {
+            let _ = hypervisor_id;
+            Err(anyhow!(Code::FailedPrecondition)
+                .context("on-demand restore is only supported on Linux"))
+        }
+    }
+}
+
 fn parse_restore_memory_population(
     source: Option<vmservice::MemorySource>,
 ) -> anyhow::Result<RestoreMemoryPopulation> {
@@ -886,6 +923,9 @@ fn parse_restore_memory_population(
         }
         value if value == vmservice::SnapshotMemoryPopulation::SharedInPlace as i32 => {
             Ok(RestoreMemoryPopulation::SharedInPlace)
+        }
+        value if value == vmservice::SnapshotMemoryPopulation::OnDemand as i32 => {
+            Ok(RestoreMemoryPopulation::OnDemand)
         }
         value if value == vmservice::SnapshotMemoryPopulation::Unspecified as i32 => {
             Err(anyhow!(Code::InvalidArgument)
@@ -1461,6 +1501,18 @@ impl VmService {
                 .context("memory backing file cannot be specified for shared-in-place restore"));
         }
 
+        let hypervisor = openvmm_helpers::hypervisor::choose_hypervisor()?;
+        if restore
+            .as_ref()
+            .is_some_and(|restore| restore.population == RestoreMemoryPopulation::OnDemand)
+        {
+            if memory_backing_file.is_some() {
+                return Err(anyhow!(Code::InvalidArgument)
+                    .context("memory backing file cannot be specified for on-demand restore"));
+            }
+            check_on_demand_restore_support(hypervisor.id())?;
+        }
+
         let (numa, config_mem_size) = if let Some(numa_config) = req_config.numa_config.take() {
             if req_config.memory_config.is_some() {
                 bail!("memory_config and numa_config are mutually exclusive");
@@ -1722,7 +1774,7 @@ impl VmService {
             .launch_worker(
                 VM_WORKER,
                 VmWorkerParameters {
-                    hypervisor: openvmm_helpers::hypervisor::choose_hypervisor()?,
+                    hypervisor,
                     cfg: config,
                     saved_state,
                     guest_ram,

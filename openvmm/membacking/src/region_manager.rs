@@ -134,6 +134,14 @@ struct SubMapping<'a> {
 impl DmaMapper {
     /// Map a sub-mapping into the IOMMU.
     fn map_dma(&self, mapping: SubMapping<'_>) -> anyhow::Result<()> {
+        // The IOMMU may access the backing directly, which would bypass
+        // on-demand population.
+        #[cfg(target_os = "linux")]
+        if let Some(mappable) = mapping.backing.mappable() {
+            crate::on_demand::check_not_populating(mappable)
+                .with_context(|| format!("failed to map {} for DMA", mapping.range))?;
+        }
+
         // The region manager always maintains an eager VaMapper, so a host VA
         // is always available and free to hand out (the backing is already
         // established).

@@ -461,6 +461,30 @@ impl MapperTask {
             return Err(MappingError::new(range, e));
         }
 
+        // If the backing is being populated on demand, the mapping must be
+        // registered before anything can access it.
+        #[cfg(target_os = "linux")]
+        {
+            let address = self.inner.mapping.as_ptr() as usize + range.start() as usize;
+            // SAFETY: guest memory is only accessed through raw pointers, and
+            // the mapping has not been published yet.
+            let r = unsafe {
+                crate::on_demand::register_mapping(
+                    mappable,
+                    address,
+                    range.len() as usize,
+                    file_offset,
+                )
+            };
+            if let Err(e) = r {
+                let _ = self
+                    .inner
+                    .mapping
+                    .unmap(range.start() as usize, range.len() as usize);
+                return Err(MappingError::new(range, e));
+            }
+        }
+
         // Deferred protect: lower the freshly-mapped writable view to read-only
         // so the first write faults; `page_fault`/`resolve` then raise the
         // touched 2 MB window back to read-write.

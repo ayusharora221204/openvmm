@@ -36,9 +36,22 @@ pub enum GuestRamSource {
         /// The snapshot memory file. Only read; never mapped.
         source: std::fs::File,
         /// File-backed object to use as guest RAM. When `None`, fresh shared
-        /// memory is allocated.
+        /// memory is allocated. Must be `None` for
+        /// [`GuestRamCopyMode::OnDemand`].
         destination: Option<SharedMemoryFd>,
+        /// When guest RAM is populated.
+        mode: GuestRamCopyMode,
     },
+}
+
+/// When guest RAM is populated from [`GuestRamSource::CopyFrom`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, MeshPayload)]
+pub enum GuestRamCopyMode {
+    /// Copy all of guest RAM before the VM starts.
+    Eager,
+    /// Copy each page when it is first accessed, and the remaining pages in
+    /// the background. Linux only.
+    OnDemand,
 }
 
 /// Launch parameters for the VM worker.

@@ -72,9 +72,25 @@ is populated:
   the clone's writable backing; it must not be `memory.bin` or a hard link to
   it. Otherwise OpenVMM allocates a fresh shared memory object. The snapshot
   is not modified and can be restored any number of times.
+* `SNAPSHOT_MEMORY_POPULATION_ON_DEMAND` allocates independent guest RAM, like
+  eager copy, but doesn't wait for the copy: the VM starts immediately, each
+  page is copied from `memory.bin` when it is first accessed, and the
+  remaining pages are copied in the background. `memory.bin` must not be
+  modified until the copy completes, which `RestoreVM` doesn't report; tear
+  down the clone before modifying or deleting the snapshot. If a page can't
+  be read from `memory.bin`, accesses to it fail. On-demand restore requires
+  Linux with KVM and [userfaultfd](https://docs.kernel.org/admin-guide/mm/userfaultfd.html)
+  with shared memory and poisoning support (Linux 6.6 or later). The OpenVMM
+  process needs read/write access to `/dev/userfaultfd`, or the
+  `vm.unprivileged_userfaultfd` sysctl must be set. Otherwise `RestoreVM`
+  fails with `FAILED_PRECONDITION`. `MemoryConfig.backing_file_path` must not
+  be set, so the clone can't be saved with `SaveVM`. Devices that access
+  guest RAM directly rather than through OpenVMM's mappings (such as
+  VFIO-assigned devices) fail to start until the copy completes.
 
-Because `source` is part of `MemoryConfig`, eager copy isn't available for VMs
-configured with `NumaConfig`. If `expected_snapshot_id` is provided, the restore
+Because `source` is part of `MemoryConfig`, eager copy and on-demand restore
+aren't available for VMs configured with `NumaConfig`. If
+`expected_snapshot_id` is provided, the restore
 fails unless it matches the snapshot ID in `manifest.bin`. An empty value is
 treated as not provided, so the ID isn't checked. The restored snapshot's ID is
 returned in `RestoreVMResponse.snapshot_id`. Set `resume` to start the restored

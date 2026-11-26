@@ -100,7 +100,9 @@ state.
 The ttrpc `RestoreVM` API also supports eager-copy restore. In that mode
 OpenVMM allocates independent RAM for the restored VM and copies `memory.bin`
 into it before applying processor and device state, so the snapshot isn't
-modified and can be restored into any number of isolated clones. See
+modified and can be restored into any number of isolated clones. On Linux with
+KVM, it also supports on-demand restore, which starts the clone immediately and
+copies each page of `memory.bin` when the guest first accesses it. See
 [gRPC / ttrpc](../../reference/openvmm/management/grpc.md#snapshots-savevm-and-restorevm).
 The `--restore-snapshot` CLI continues to use the shared-in-place behavior
 described above.

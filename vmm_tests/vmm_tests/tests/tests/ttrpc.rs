@@ -1818,6 +1818,99 @@ async fn test_ttrpc_interface(
                         .unwrap();
                 }
 
+                // Restore a clone on demand: the guest runs while its memory
+                // is still being populated from the snapshot. This is only
+                // supported on Linux with KVM and userfaultfd access; other
+                // hosts must reject it up front.
+                let on_demand_config = |backing_file_path: Option<&Path>| {
+                    let mut config = restore_config.clone().unwrap();
+                    let memory = config.memory_config.as_mut().unwrap();
+                    memory.backing_file_path =
+                        backing_file_path.map(|path| path.to_string_lossy().into_owned());
+                    memory.source = Some(vmservice::MemorySource {
+                        kind: Some(vmservice::memory_source::Kind::Snapshot(
+                            vmservice::SnapshotMemorySource {
+                                population: vmservice::SnapshotMemoryPopulation::OnDemand as i32,
+                            },
+                        )),
+                    });
+                    Some(config)
+                };
+                let err = client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_dir: snapshot_path.to_string_lossy().into_owned(),
+                            config: on_demand_config(Some(&eager_memory_path)),
+                            expected_snapshot_id: Some(snapshot_id.clone()),
+                            resume: false,
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    mesh_rpc::service::Code::InvalidArgument as i32,
+                    "RestoreVm on demand with a backing file: {}",
+                    err.message
+                );
+                let on_demand_result = client
+                    .call()
+                    .start(
+                        vmservice::Vm::RestoreVm,
+                        vmservice::RestoreVmRequest {
+                            source_dir: snapshot_path.to_string_lossy().into_owned(),
+                            config: on_demand_config(None),
+                            expected_snapshot_id: Some(snapshot_id.clone()),
+                            resume: false,
+                        },
+                    )
+                    .await;
+                match on_demand_result {
+                    Ok(restore_result) => {
+                        assert_eq!(restore_result.snapshot_id, snapshot_id);
+                        // As below, a restored aarch64 guest can't run yet.
+                        if petri_artifacts_common::tags::MachineArch::host()
+                            == petri_artifacts_common::tags::MachineArch::X86_64
+                        {
+                            let mut shell = SerialShell::new(
+                                &driver,
+                                PolledSocket::new(&driver, UnixStream::connect(&com1_path)?)?,
+                                params.log_source.log_file("linux-on-demand-restored")?,
+                            );
+                            client
+                                .call()
+                                .start(vmservice::Vm::ResumeVm, ())
+                                .await
+                                .unwrap();
+                            shell.run("echo ONDEMAND-$((40+6))", "ONDEMAND-46").await?;
+                            assert!(
+                                !shell.output.contains("Linux version"),
+                                "the on-demand clone rebooted"
+                            );
+                        }
+                        // Tear down while the memory may still be populating.
+                        client
+                            .call()
+                            .start(vmservice::Vm::TeardownVm, ())
+                            .await
+                            .unwrap();
+                    }
+                    Err(err) => {
+                        assert_eq!(
+                            err.code,
+                            mesh_rpc::service::Code::FailedPrecondition as i32,
+                            "RestoreVm on demand: {}",
+                            err.message
+                        );
+                        tracing::info!(
+                            message = err.message,
+                            "on-demand restore is not supported on this host"
+                        );
+                    }
+                }
+
                 let restore_result = client
                     .call()
                     .start(

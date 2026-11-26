@@ -93,6 +93,7 @@ use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::config::X86TopologyConfig;
 use openvmm_defs::rpc::PulseSaveRestoreError;
 use openvmm_defs::rpc::VmRpc;
+use openvmm_defs::worker::GuestRamCopyMode;
 use openvmm_defs::worker::GuestRamSource;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -1438,7 +1439,14 @@ impl InitializedVm {
             Some(GuestRamSource::CopyFrom {
                 source,
                 destination,
-            }) => (destination.map(Mappable::from), Some(source)),
+                mode,
+            }) => {
+                let mode = match mode {
+                    GuestRamCopyMode::Eager => membacking::CopyMode::Eager,
+                    GuestRamCopyMode::OnDemand => membacking::CopyMode::OnDemand,
+                };
+                (destination.map(Mappable::from), Some((source, mode)))
+            }
         };
 
         let mut memory_builder = GuestMemoryBuilder::new();
@@ -1476,8 +1484,8 @@ impl InitializedVm {
             if let Some(mappable) = existing_mappable.take() {
                 backing = backing.existing_mappable(mappable);
             }
-            if let Some(file) = copy_from.take() {
-                backing = backing.copy_from(file);
+            if let Some((file, mode)) = copy_from.take() {
+                backing = backing.copy_from(file, mode);
             }
 
             memory_builder = memory_builder.add_backing(backing);
@@ -3820,6 +3828,11 @@ impl LoadedVm {
                             let shared_memory = self.inner.memory_manager.shared_memory_backing();
                             if shared_memory.is_none() {
                                 anyhow::bail!("restart is not supported with --private-memory");
+                            }
+                            if self.inner.memory_manager.on_demand_population_pending() {
+                                anyhow::bail!(
+                                    "restart is not supported while guest RAM is being populated on demand"
+                                );
                             }
                             if self.running {
                                 self.state_units.stop().await;

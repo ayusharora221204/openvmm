@@ -66,6 +66,8 @@
 
 mod mapping_manager;
 mod memory_manager;
+#[cfg(target_os = "linux")]
+mod on_demand;
 mod partition_mapper;
 mod region_manager;
 
@@ -91,6 +93,7 @@ mod sys {
 pub type RemoteProcess = sys::RemoteProcess;
 
 pub use mapping_manager::Mappable;
+pub use memory_manager::CopyMode;
 pub use memory_manager::DeviceMemoryMapper;
 pub use memory_manager::GuestMemoryBuilder;
 pub use memory_manager::GuestMemoryClient;
@@ -101,6 +104,7 @@ pub use memory_manager::RamBackingRequest;
 pub use memory_manager::RamVisibility;
 pub use memory_manager::RamVisibilityControl;
 pub use memory_manager::SharedMemoryBacking;
+pub use memory_manager::check_on_demand_support;
 pub use region_manager::DmaMapRequest;
 pub use region_manager::DmaMapperClient;
 pub use region_manager::DmaMapperHandle;

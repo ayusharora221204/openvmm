@@ -835,6 +835,15 @@ impl ProvideShareableRegions for DmaRegionProvider {
             .call(MappingRequest::GetDmaTargetMappings, ())
             .await?;
 
+        // External users access the backing directly, which would bypass
+        // on-demand population.
+        #[cfg(target_os = "linux")]
+        for m in &mappings {
+            if let Some(mappable) = m.backing.mappable() {
+                crate::on_demand::check_not_populating(mappable)?;
+            }
+        }
+
         Ok(mappings
             .into_iter()
             .filter_map(|m| {

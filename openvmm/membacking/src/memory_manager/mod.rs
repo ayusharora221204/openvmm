@@ -64,6 +64,10 @@ pub struct GuestMemoryManager {
     /// enabling on-demand fault resolution via [`VaMapper`]. Recorded here for
     /// lazy-commit gating.
     supports_memory_fault_resolution: bool,
+    /// Backings being populated on demand.
+    #[cfg(target_os = "linux")]
+    #[inspect(iter_by_index)]
+    on_demand: Vec<crate::on_demand::OnDemandPopulator>,
 }
 
 /// A single RAM backing allocation — one memfd or anonymous region.
@@ -79,8 +83,8 @@ struct RamBacking {
     transparent_hugepages: bool,
     /// Host NUMA node for this backing. `None` means OS default placement.
     host_numa_node: Option<u32>,
-    /// File to populate this backing from at build time. Taken (and closed)
-    /// once population completes.
+    /// File to eagerly populate this backing from at build time. Taken (and
+    /// closed) once population completes.
     copy_from: Option<File>,
 }
 
@@ -190,6 +194,24 @@ pub enum MemoryBuildError {
         #[source]
         error: guestmem::GuestMemoryError,
     },
+    /// On-demand population is only supported on Linux.
+    #[error("on-demand guest RAM population is only supported on Linux")]
+    OnDemandUnsupportedPlatform,
+    /// On-demand population is incompatible with an existing memory backing.
+    #[error("on-demand guest RAM population is incompatible with an existing memory backing")]
+    OnDemandWithExistingBacking,
+    /// On-demand population is incompatible with hugepages.
+    #[error("on-demand guest RAM population is incompatible with hugepages")]
+    OnDemandWithHugepages,
+    /// On-demand population is incompatible with prefetch.
+    #[error("on-demand guest RAM population is incompatible with prefetch")]
+    OnDemandWithPrefetch,
+    /// On-demand population is incompatible with pinned mappings.
+    #[error("on-demand guest RAM population is incompatible with pinned mappings")]
+    OnDemandWithPinnedMappings,
+    /// Failed to start on-demand population.
+    #[error("failed to start on-demand guest RAM population")]
+    OnDemandStart(#[source] io::Error),
     /// Hugepage size is too large.
     #[error("hugepage size {0} is too large")]
     HugepageSizeTooLarge(MemorySize),
@@ -252,7 +274,39 @@ pub struct RamBackingRequest {
     hugepage_size: Option<u64>,
     existing_mappable: Option<Mappable>,
     host_numa_node: Option<u32>,
-    copy_from: Option<File>,
+    copy_from: Option<(File, CopyMode)>,
+}
+
+/// When a backing populated by [`RamBackingRequest::copy_from`] is filled.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CopyMode {
+    /// Copy the whole file into the backing before
+    /// [`GuestMemoryBuilder::build`] returns.
+    Eager,
+    /// Fill each page from the file when it is first accessed, and fill the
+    /// remaining pages in the background. Every access to the backing must go
+    /// through mappings created by the memory manager in this process.
+    ///
+    /// Linux only. Requires `userfaultfd` with support for shared memory and
+    /// poisoning (Linux 6.6 or later), and access to `/dev/userfaultfd` (or
+    /// the `vm.unprivileged_userfaultfd` sysctl). Use
+    /// [`check_on_demand_support`] to check for support up front. Not
+    /// supported with an existing backing, hugepages, prefetch, or pinned
+    /// mappings.
+    OnDemand,
+}
+
+/// Checks whether this host supports [`CopyMode::OnDemand`].
+pub fn check_on_demand_support() -> io::Result<()> {
+    cfg_select! {
+        target_os = "linux" => crate::on_demand::check_support(
+            sparse_mmap::userfaultfd::FaultScope::All,
+        ),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "on-demand guest RAM population is only supported on Linux",
+        )),
+    }
 }
 
 impl RamBackingRequest {
@@ -313,16 +367,16 @@ impl RamBackingRequest {
         self
     }
 
-    /// Populate this backing from `file` at build time.
+    /// Populate this backing from `file`, as selected by `mode`.
     ///
     /// `file` must hold this backing's contents in backing layout order: each
     /// RAM range's bytes at the same offset the range occupies within the
     /// backing. Its length must equal the sum of the range lengths. The
-    /// backing itself is allocated normally (or taken from
-    /// [`Self::existing_mappable`]); `file` is only read. Requires shared
-    /// memory.
-    pub fn copy_from(mut self, file: File) -> Self {
-        self.copy_from = Some(file);
+    /// backing itself is allocated normally (or, for [`CopyMode::Eager`],
+    /// taken from [`Self::existing_mappable`]); `file` is only read. Requires
+    /// shared memory.
+    pub fn copy_from(mut self, file: File, mode: CopyMode) -> Self {
+        self.copy_from = Some((file, mode));
         self
     }
 
@@ -396,6 +450,21 @@ fn validate_hugepage_ram_alignment(
     Ok(())
 }
 
+/// Checks that a population source holds exactly `backing_len` bytes.
+fn check_population_source(file: &File, backing_len: u64) -> Result<(), MemoryBuildError> {
+    let file_len = file
+        .metadata()
+        .map_err(MemoryBuildError::PopulateSource)?
+        .len();
+    if file_len != backing_len {
+        return Err(MemoryBuildError::PopulateSizeMismatch {
+            file_len,
+            backing_len,
+        });
+    }
+    Ok(())
+}
+
 /// Copies `(range, offset)` pairs from `file` into guest memory: the bytes at
 /// `offset` within `file` are written to `range`.
 fn populate_ranges(
@@ -431,6 +500,9 @@ pub struct GuestMemoryBuilder {
     x86_legacy_support: bool,
     supports_memory_fault_resolution: bool,
     backing_requests: Vec<RamBackingRequest>,
+    /// The faults handled while populating guest RAM on demand.
+    #[cfg(target_os = "linux")]
+    on_demand_fault_scope: sparse_mmap::userfaultfd::FaultScope,
 }
 
 impl GuestMemoryBuilder {
@@ -442,7 +514,17 @@ impl GuestMemoryBuilder {
             x86_legacy_support: false,
             supports_memory_fault_resolution: false,
             backing_requests: Vec::new(),
+            #[cfg(target_os = "linux")]
+            on_demand_fault_scope: sparse_mmap::userfaultfd::FaultScope::All,
         }
+    }
+
+    /// Handles only user-mode faults while populating guest RAM on demand, so
+    /// that unit tests can run unprivileged.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn on_demand_user_mode_only(mut self) -> Self {
+        self.on_demand_fault_scope = sparse_mmap::userfaultfd::FaultScope::UserModeOnly;
+        self
     }
 
     /// Specifies the offset of the VTL0 alias map, if enabled for VTL2. This is
@@ -513,6 +595,23 @@ impl GuestMemoryBuilder {
             if req.private_memory && req.copy_from.is_some() {
                 return Err(MemoryBuildError::PopulateWithPrivateMemory);
             }
+            if let Some((_, CopyMode::OnDemand)) = &req.copy_from {
+                if !cfg!(target_os = "linux") {
+                    return Err(MemoryBuildError::OnDemandUnsupportedPlatform);
+                }
+                if req.existing_mappable.is_some() {
+                    return Err(MemoryBuildError::OnDemandWithExistingBacking);
+                }
+                if req.hugepages {
+                    return Err(MemoryBuildError::OnDemandWithHugepages);
+                }
+                if req.prefetch {
+                    return Err(MemoryBuildError::OnDemandWithPrefetch);
+                }
+                if self.pin_mappings {
+                    return Err(MemoryBuildError::OnDemandWithPinnedMappings);
+                }
+            }
             if req.host_numa_node.is_some()
                 && cfg!(not(any(target_os = "linux", target_os = "windows")))
             {
@@ -564,6 +663,8 @@ impl GuestMemoryBuilder {
         // Allocate per-backing memory.
         let num_backings = backing_requests.len();
         let mut backings = Vec::with_capacity(num_backings);
+        #[cfg(target_os = "linux")]
+        let mut on_demand = Vec::new();
         for (i, req) in backing_requests.into_iter().enumerate() {
             let size: u64 = req.ranges.iter().map(|r| r.len()).sum();
 
@@ -580,7 +681,7 @@ impl GuestMemoryBuilder {
             }
 
             // Shared (file-backed) backing: reuse existing or allocate fresh.
-            let mappable = if let Some(existing) = req.existing_mappable {
+            let mappable: Mappable = if let Some(existing) = req.existing_mappable {
                 existing
             } else {
                 let backing_size: usize = size
@@ -622,6 +723,33 @@ impl GuestMemoryBuilder {
                 }
             };
 
+            let copy_from = match req.copy_from {
+                None => None,
+                Some((file, mode)) => {
+                    check_population_source(&file, size)?;
+                    match mode {
+                        CopyMode::Eager => Some(file),
+                        // Start population before anything maps the backing, so
+                        // that every mapping is registered for faults.
+                        CopyMode::OnDemand => cfg_select! {
+                            target_os = "linux" => {{
+                                on_demand.push(
+                                    crate::on_demand::OnDemandPopulator::new(
+                                        &mappable,
+                                        file,
+                                        size,
+                                        self.on_demand_fault_scope,
+                                    )
+                                        .map_err(MemoryBuildError::OnDemandStart)?,
+                                );
+                                None
+                            }}
+                            _ => return Err(MemoryBuildError::OnDemandUnsupportedPlatform),
+                        },
+                    }
+                }
+            };
+
             backings.push(RamBacking {
                 mappable: Some(mappable),
                 ranges: req.ranges,
@@ -637,7 +765,7 @@ impl GuestMemoryBuilder {
                 // backings are already huge, so suppress THP there.
                 transparent_hugepages: req.transparent_hugepages && !req.hugepages,
                 host_numa_node: req.host_numa_node,
-                copy_from: req.copy_from,
+                copy_from,
             });
         }
 
@@ -776,17 +904,6 @@ impl GuestMemoryBuilder {
                 let Some(mut file) = backing.copy_from.take() else {
                     continue;
                 };
-                let backing_len: u64 = backing.ranges.iter().map(|r| r.len()).sum();
-                let file_len = file
-                    .metadata()
-                    .map_err(MemoryBuildError::PopulateSource)?
-                    .len();
-                if file_len != backing_len {
-                    return Err(MemoryBuildError::PopulateSizeMismatch {
-                        file_len,
-                        backing_len,
-                    });
-                }
                 let plan = populate_plan
                     .iter()
                     .filter(|(index, ..)| *index == backing_index)
@@ -805,6 +922,8 @@ impl GuestMemoryBuilder {
             vtl0_alias_map_offset,
             pin_mappings: self.pin_mappings,
             supports_memory_fault_resolution: self.supports_memory_fault_resolution,
+            #[cfg(target_os = "linux")]
+            on_demand,
         };
         Ok(gm)
     }
@@ -889,6 +1008,17 @@ impl GuestMemoryManager {
     pub fn ram_visibility_control(&self) -> RamVisibilityControl {
         RamVisibilityControl {
             regions: self.ram_regions.clone(),
+        }
+    }
+
+    /// Returns whether any guest RAM is still being populated on demand (see
+    /// [`CopyMode::OnDemand`]). While it is, the backing's contents are
+    /// incomplete, so it must not be accessed other than through this memory
+    /// manager's mappings.
+    pub fn on_demand_population_pending(&self) -> bool {
+        cfg_select! {
+            target_os = "linux" => self.on_demand.iter().any(|p| p.is_pending()),
+            _ => false,
         }
     }
 
@@ -1099,7 +1229,9 @@ mod tests {
         let mut bytes = vec![0xaa; page as usize];
         bytes.extend(vec![0xbb; page as usize]);
         let mgr = GuestMemoryBuilder::new()
-            .add_backing(RamBackingRequest::new(ranges).copy_from(source_file(&bytes)))
+            .add_backing(
+                RamBackingRequest::new(ranges).copy_from(source_file(&bytes), CopyMode::Eager),
+            )
             .build(3 * page)
             .await
             .unwrap();
@@ -1125,7 +1257,7 @@ mod tests {
             .add_backing(
                 RamBackingRequest::new(ranges.clone())
                     .existing_mappable(destination.clone())
-                    .copy_from(source_file(&bytes)),
+                    .copy_from(source_file(&bytes), CopyMode::Eager),
             )
             .build(size)
             .await
@@ -1143,6 +1275,177 @@ mod tests {
         let mut buf = vec![0u8; size as usize];
         gm.read_at(0, &mut buf).unwrap();
         assert_eq!(buf, bytes);
+    }
+
+    /// Returns `len` bytes where each page is filled with its page index as a
+    /// repeated little-endian `u32`.
+    #[cfg(target_os = "linux")]
+    fn page_tagged(len: u64) -> Vec<u8> {
+        let page = SparseMapping::page_size() as u64;
+        (0..len / page)
+            .flat_map(|p| (p as u32).to_le_bytes().repeat(page as usize / 4))
+            .collect()
+    }
+
+    /// Returns whether on-demand population can be tested on this host.
+    #[cfg(target_os = "linux")]
+    fn on_demand_supported() -> bool {
+        match crate::on_demand::check_support(sparse_mmap::userfaultfd::FaultScope::UserModeOnly) {
+            Ok(()) => true,
+            Err(err) => {
+                // Some kernels or sandboxes disable userfaultfd entirely.
+                eprintln!("skipping: {err}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_on_demand_population(mgr: &GuestMemoryManager) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while mgr.on_demand_population_pending() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "population did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn on_demand_populates_on_access_and_in_background() {
+        if !on_demand_supported() {
+            return;
+        }
+        // Use the x86 legacy split and a gap between ranges, so that the
+        // backing is mapped as several mappings at different offsets.
+        const MB: u64 = 1024 * 1024;
+        let ranges = vec![
+            MemoryRange::new(0..16 * MB),
+            MemoryRange::new(32 * MB..48 * MB),
+        ];
+        let bytes = page_tagged(32 * MB);
+        let mgr = GuestMemoryBuilder::new()
+            .on_demand_user_mode_only()
+            .x86_legacy_support(true)
+            .add_backing(
+                RamBackingRequest::new(ranges).copy_from(source_file(&bytes), CopyMode::OnDemand),
+            )
+            .build(48 * MB)
+            .await
+            .unwrap();
+        let gm = mgr.client().guest_memory().await.unwrap();
+        let page = SparseMapping::page_size() as u64;
+
+        // Write the last page before the background thread reaches it: the
+        // write must not be overwritten by the source.
+        let last = 48 * MB - page;
+        gm.write_at(last, &vec![0xcc; page as usize]).unwrap();
+
+        // Fault pages from several threads at once, racing each other and the
+        // background thread.
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let gm = gm.clone();
+                let bytes = &bytes;
+                s.spawn(move || {
+                    let mut buf = vec![0; page as usize];
+                    for p in (0..32 * MB / page - 1).rev().filter(|p| p % 2 == t % 2) {
+                        let gpa = if p * page < 16 * MB {
+                            p * page
+                        } else {
+                            16 * MB + p * page
+                        };
+                        gm.read_at(gpa, &mut buf).unwrap();
+                        let offset = (p * page) as usize;
+                        assert_eq!(buf, bytes[offset..offset + page as usize], "page {p}");
+                    }
+                });
+            }
+        });
+
+        wait_for_on_demand_population(&mgr).await;
+        let mut buf = vec![0; 16 * MB as usize];
+        gm.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, bytes[..16 * MB as usize]);
+        gm.read_at(32 * MB, &mut buf).unwrap();
+        let mut expected = bytes[16 * MB as usize..].to_vec();
+        expected[(16 * MB - page) as usize..].fill(0xcc);
+        assert_eq!(buf, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn on_demand_read_failure_fails_accesses() {
+        if !on_demand_supported() {
+            return;
+        }
+        let size = 16 * SparseMapping::page_size() as u64;
+        // A write-only source has the right size, but every read fails.
+        let path = tempfile::NamedTempFile::new().unwrap();
+        path.as_file().set_len(size).unwrap();
+        let source = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.path())
+            .unwrap();
+        let mgr = GuestMemoryBuilder::new()
+            .on_demand_user_mode_only()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..size)])
+                    .copy_from(source, CopyMode::OnDemand),
+            )
+            .build(size)
+            .await
+            .unwrap();
+        let gm = mgr.client().guest_memory().await.unwrap();
+
+        // The access fails instead of observing unpopulated memory.
+        gm.read_at(0, &mut [0; 8]).unwrap_err();
+        // The failed population never completes.
+        assert!(mgr.on_demand_population_pending());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn on_demand_rejects_incompatible_backings() {
+        let size = 2 * 1024 * 1024;
+        let request = || {
+            RamBackingRequest::new(vec![MemoryRange::new(0..size)])
+                .copy_from(source_file(&vec![0; size as usize]), CopyMode::OnDemand)
+        };
+        let build = async |request, pin| {
+            GuestMemoryBuilder::new()
+                .pin_mappings(pin)
+                .add_backing(request)
+                .build(size)
+                .await
+                .unwrap_err()
+        };
+        let existing: Mappable = sparse_mmap::alloc_shared_memory(size as usize, "dest")
+            .unwrap()
+            .into();
+
+        assert!(matches!(
+            build(request().existing_mappable(existing), false).await,
+            MemoryBuildError::OnDemandWithExistingBacking
+        ));
+        assert!(matches!(
+            build(request().hugepages(None), false).await,
+            MemoryBuildError::OnDemandWithHugepages
+        ));
+        assert!(matches!(
+            build(request().prefetch(true), false).await,
+            MemoryBuildError::OnDemandWithPrefetch
+        ));
+        assert!(matches!(
+            build(request(), true).await,
+            MemoryBuildError::OnDemandWithPinnedMappings
+        ));
+        assert!(matches!(
+            build(request().private_memory(true), false).await,
+            MemoryBuildError::PopulateWithPrivateMemory
+        ));
     }
 
     #[async_test]

@@ -10,6 +10,7 @@
 
 pub mod alloc;
 pub mod unix;
+pub mod userfaultfd;
 pub mod windows;
 
 cfg_select! {
